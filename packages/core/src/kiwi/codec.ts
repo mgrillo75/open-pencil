@@ -234,6 +234,12 @@ export interface VariableDataValuesEntry {
   variableData: VariableDataEntry
 }
 
+export interface PluginDataEntry {
+  pluginID: string
+  value: string
+  key: string
+}
+
 export interface NodeChange {
   [key: string]: unknown
   guid: GUID
@@ -304,6 +310,7 @@ export interface NodeChange {
   stateGroupPropertyValueOrders?: Array<{ property: string; values: string[] }>
   // Internal
   internalOnly?: boolean
+  pluginData?: PluginDataEntry[]
   // Corners
   rectangleTopLeftCornerRadius?: number
   rectangleTopRightCornerRadius?: number

@@ -31,7 +31,7 @@ import type {
   CharacterStyleOverride,
   WindingRule
 } from '../scene-graph'
-import type { NodeChange, Paint, Effect as KiwiEffect, GUID } from './codec'
+import type { NodeChange, Paint, Effect as KiwiEffect, GUID, PluginDataEntry } from './codec'
 
 
 
@@ -77,6 +77,20 @@ function imageHashToString(hash: Record<string, number>): string {
     .sort((a, b) => Number(a) - Number(b))
     .map((k) => hash[Number(k)])
   return bytes.map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+function pluginDataKey(pluginID: string, key: string): string {
+  return `${pluginID}:${key}`
+}
+
+function convertPluginData(entries?: PluginDataEntry[]): Record<string, string> {
+  if (!entries?.length) return {}
+  const result: Record<string, string> = {}
+  for (const entry of entries) {
+    if (!entry.pluginID || !entry.key) continue
+    result[pluginDataKey(entry.pluginID, entry.key)] = entry.value ?? ''
+  }
+  return result
 }
 
 function convertGradientTransform(t?: {
@@ -570,6 +584,7 @@ export function nodeChangeToProps(
     expanded: true,
     textTruncation: (nc.textTruncation as string) === 'ENDING' ? 'ENDING' : 'DISABLED',
     autoRename: (nc.autoRename as boolean) ?? true,
+    pluginData: convertPluginData(nc.pluginData),
     boundVariables: extractBoundVariables(nc),
     clipsContent: nc.frameMaskDisabled === false,
     componentId: extractSymbolId(nc)

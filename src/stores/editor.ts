@@ -13,6 +13,13 @@ import {
 } from '@/constants'
 import { loadFont } from '@/engine/fonts'
 import {
+  UIVERSE_PLUGIN_DATA_KEY,
+  getUiverseNodeData,
+  serializeUiverseNodeData,
+  type UiverseNodeData,
+  type UiverseSelectionBinding
+} from '@/composables/uiverse-data'
+import {
   collectFontKeys,
   computeLayout,
   computeAllLayouts,
@@ -112,11 +119,39 @@ const DEFAULT_FILLS: Record<string, Fill> = {
   TEXT: BLACK_FILL
 }
 
+async function createImageAssetHash(data: Uint8Array): Promise<string> {
+  const webCrypto = typeof globalThis.crypto !== 'undefined' ? globalThis.crypto : null
+  if (webCrypto?.subtle) {
+    const copy = Uint8Array.from(data)
+    const digest = await webCrypto.subtle.digest(
+      'SHA-256',
+      copy.buffer as ArrayBuffer
+    )
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  }
+
+  const fallback = new Uint8Array(16)
+  webCrypto?.getRandomValues(fallback)
+  return Array.from(fallback, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 interface PageViewport {
   panX: number
   panY: number
   zoom: number
   pageColor: Color
+}
+
+interface UiverseCanvasPlacement {
+  data: UiverseNodeData
+  pngBytes: Uint8Array
+  width: number
+  height: number
+}
+
+interface UiverseNodeSnapshot {
+  parentId: string
+  snapshot: SceneNode
 }
 
 export function createEditorStore() {
@@ -240,6 +275,278 @@ export function createEditorStore() {
     void state.sceneVersion
     return graph.flattenTree(state.currentPageId)
   })
+
+  function cloneSceneNode(node: SceneNode): SceneNode {
+    return structuredClone(node)
+  }
+
+  function createUiverseImageFill(imageHash: string): Fill {
+    return {
+      type: 'IMAGE',
+      color: { r: 1, g: 1, b: 1, a: 1 },
+      opacity: 1,
+      visible: true,
+      imageHash,
+      imageScaleMode: 'FILL'
+    }
+  }
+
+  function getCanvasViewportCenter() {
+    const viewCenterX = (-state.panX + window.innerWidth / 2) / state.zoom
+    const viewCenterY = (-state.panY + window.innerHeight / 2) / state.zoom
+    return { x: viewCenterX, y: viewCenterY }
+  }
+
+  function getUiverseBinding(nodeId: string): UiverseSelectionBinding | null {
+    const node = graph.getNode(nodeId)
+    if (!node) return null
+
+    const directData = getUiverseNodeData(node)
+    if (directData && node.type === 'FRAME') {
+      const previewNode = graph
+        .getChildren(node.id)
+        .find((child) => child.type === 'RECTANGLE')
+      return {
+        frameId: node.id,
+        previewNodeId: previewNode?.id ?? null,
+        data: directData
+      }
+    }
+
+    if (!node.parentId) return null
+    const parent = graph.getNode(node.parentId)
+    if (!parent || parent.type !== 'FRAME') return null
+
+    const parentData = getUiverseNodeData(parent)
+    if (!parentData) return null
+
+    return {
+      frameId: parent.id,
+      previewNodeId: node.type === 'RECTANGLE' ? node.id : null,
+      data: parentData
+    }
+  }
+
+  function getSelectedUiverseBinding(): UiverseSelectionBinding | null {
+    if (state.selectedIds.size !== 1) return null
+    const id = [...state.selectedIds][0]
+    return getUiverseBinding(id)
+  }
+
+  function applyUiverseFrameState(
+    frameId: string,
+    previewNodeId: string | null,
+    data: UiverseNodeData,
+    imageHash: string,
+    width: number,
+    height: number
+  ): string {
+    const frame = graph.getNode(frameId)
+    if (!frame) throw new Error('Missing Uiverse frame')
+
+    const nextPluginData = {
+      ...frame.pluginData,
+      [UIVERSE_PLUGIN_DATA_KEY]: serializeUiverseNodeData({
+        ...data,
+        lastSnapshotHash: imageHash
+      })
+    }
+
+    graph.updateNode(frameId, {
+      name: data.title?.trim() || data.friendlyId || 'Uiverse component',
+      width,
+      height,
+      pluginData: nextPluginData
+    })
+
+    const imageFill = createUiverseImageFill(imageHash)
+    if (previewNodeId) {
+      graph.updateNode(previewNodeId, {
+        name: 'Rendered preview',
+        x: 0,
+        y: 0,
+        width,
+        height,
+        fills: [imageFill],
+        strokes: [],
+        effects: [],
+        rotation: 0
+      })
+      return previewNodeId
+    }
+
+    const previewNode = graph.createNode('RECTANGLE', frameId, {
+      name: 'Rendered preview',
+      x: 0,
+      y: 0,
+      width,
+      height,
+      fills: [imageFill],
+      strokes: [],
+      effects: []
+    })
+    return previewNode.id
+  }
+
+  async function placeUiverseSnapshot({
+    data,
+    pngBytes,
+    width,
+    height
+  }: UiverseCanvasPlacement): Promise<string | null> {
+    if (width <= 0 || height <= 0 || pngBytes.length === 0) return null
+
+    const imageHash = await createImageAssetHash(pngBytes)
+    const previousImage = graph.images.get(imageHash)
+    graph.images.set(imageHash, pngBytes)
+
+    const selection = getSelectedUiverseBinding()
+    if (selection) {
+      const frame = graph.getNode(selection.frameId)
+      if (!frame) return null
+
+      const previousFrame = cloneSceneNode(frame)
+      const previousPreview = selection.previewNodeId
+        ? graph.getNode(selection.previewNodeId)
+        : null
+      const previousPreviewSnapshot = previousPreview
+        ? {
+            parentId: previousPreview.parentId ?? frame.id,
+            snapshot: cloneSceneNode(previousPreview)
+          }
+        : null
+
+      const appliedPreviewId = applyUiverseFrameState(
+        selection.frameId,
+        selection.previewNodeId,
+        data,
+        imageHash,
+        width,
+        height
+      )
+      const updatedPreview = graph.getNode(appliedPreviewId)
+      if (!updatedPreview) return null
+
+      const nextFrame = cloneSceneNode(graph.getNode(selection.frameId) ?? frame)
+      const nextPreview: UiverseNodeSnapshot = {
+        parentId: updatedPreview.parentId ?? selection.frameId,
+        snapshot: cloneSceneNode(updatedPreview)
+      }
+      const previousSelection = new Set(state.selectedIds)
+      runLayoutForNode(selection.frameId)
+
+      undo.push({
+        label: 'Update Uiverse import',
+        forward: () => {
+          graph.images.set(imageHash, pngBytes)
+          graph.updateNode(selection.frameId, cloneSceneNode(nextFrame))
+          if (graph.getNode(nextPreview.snapshot.id)) {
+            graph.updateNode(nextPreview.snapshot.id, cloneSceneNode(nextPreview.snapshot))
+          } else {
+            graph.createNode(nextPreview.snapshot.type, nextPreview.parentId, {
+              ...cloneSceneNode(nextPreview.snapshot),
+              childIds: []
+            })
+          }
+          runLayoutForNode(selection.frameId)
+          state.selectedIds = new Set([selection.frameId])
+          requestRender()
+        },
+        inverse: () => {
+          if (previousImage) graph.images.set(imageHash, previousImage)
+          else graph.images.delete(imageHash)
+
+          if (previousPreviewSnapshot) {
+            if (graph.getNode(previousPreviewSnapshot.snapshot.id)) {
+              graph.updateNode(
+                previousPreviewSnapshot.snapshot.id,
+                cloneSceneNode(previousPreviewSnapshot.snapshot)
+              )
+            } else {
+              graph.createNode(previousPreviewSnapshot.snapshot.type, previousPreviewSnapshot.parentId, {
+                ...cloneSceneNode(previousPreviewSnapshot.snapshot),
+                childIds: []
+              })
+            }
+          } else if (graph.getNode(nextPreview.snapshot.id)) {
+            graph.deleteNode(nextPreview.snapshot.id)
+          }
+
+          graph.updateNode(selection.frameId, cloneSceneNode(previousFrame))
+          runLayoutForNode(selection.frameId)
+          state.selectedIds = previousSelection
+          requestRender()
+        }
+      })
+
+      state.selectedIds = new Set([selection.frameId])
+      requestRender()
+      return selection.frameId
+    }
+
+    const center = getCanvasViewportCenter()
+    const frame = graph.createNode('FRAME', state.currentPageId, {
+      name: data.title?.trim() || data.friendlyId || 'Uiverse component',
+      x: center.x - width / 2,
+      y: center.y - height / 2,
+      width,
+      height,
+      fills: [],
+      strokes: [],
+      clipsContent: false,
+      pluginData: {
+        [UIVERSE_PLUGIN_DATA_KEY]: serializeUiverseNodeData({
+          ...data,
+          lastSnapshotHash: imageHash
+        })
+      }
+    })
+    const preview = graph.createNode('RECTANGLE', frame.id, {
+      name: 'Rendered preview',
+      x: 0,
+      y: 0,
+      width,
+      height,
+      fills: [createUiverseImageFill(imageHash)],
+      strokes: [],
+      effects: []
+    })
+
+    const created: UiverseNodeSnapshot[] = [
+      { parentId: state.currentPageId, snapshot: cloneSceneNode(frame) },
+      { parentId: frame.id, snapshot: cloneSceneNode(preview) }
+    ]
+    const previousSelection = new Set(state.selectedIds)
+    runLayoutForNode(frame.id)
+
+    undo.push({
+      label: 'Place Uiverse import',
+      forward: () => {
+        graph.images.set(imageHash, pngBytes)
+        for (const entry of created) {
+          if (graph.getNode(entry.snapshot.id)) continue
+          graph.createNode(entry.snapshot.type, entry.parentId, {
+            ...cloneSceneNode(entry.snapshot),
+            childIds: []
+          })
+        }
+        runLayoutForNode(frame.id)
+        state.selectedIds = new Set([frame.id])
+        requestRender()
+      },
+      inverse: () => {
+        if (previousImage) graph.images.set(imageHash, previousImage)
+        else graph.images.delete(imageHash)
+        if (graph.getNode(frame.id)) graph.deleteNode(frame.id)
+        state.selectedIds = previousSelection
+        requestRender()
+      }
+    })
+
+    state.selectedIds = new Set([frame.id])
+    requestRender()
+    return frame.id
+  }
 
   function requestRender() {
     state.renderVersion++
@@ -2201,7 +2508,10 @@ export function createEditorStore() {
     toggleLock,
     moveToPage,
     renameNode,
+    getUiverseBinding,
+    getSelectedUiverseBinding,
     createShape,
+    placeUiverseSnapshot,
     adoptNodesIntoSection,
     duplicateSelected,
     writeCopyData,

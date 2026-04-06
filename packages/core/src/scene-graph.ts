@@ -290,6 +290,7 @@ export interface SceneNode {
 
   componentId: string | null
   overrides: Record<string, unknown>
+  pluginData: Record<string, string>
 
   boundVariables: Record<string, string>
 
@@ -425,6 +426,7 @@ function createDefaultNode(type: NodeType, overrides: Partial<SceneNode> = {}): 
     starInnerRadius: 0.38,
     componentId: null,
     overrides: {},
+    pluginData: {},
     boundVariables: {},
     internalOnly: false,
     flipX: false,

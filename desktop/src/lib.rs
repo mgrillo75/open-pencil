@@ -4,8 +4,10 @@ use tauri::{
 };
 
 use font_kit::source::SystemSource;
-use serde::Serialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::sync::OnceLock;
+use std::process::Command;
+use std::time::Duration;
 
 #[derive(Serialize, Clone)]
 struct FontFamily {
@@ -14,6 +16,293 @@ struct FontFamily {
 }
 
 static FONT_CACHE: OnceLock<Vec<FontFamily>> = OnceLock::new();
+
+const UIVERSE_HOST: &str = "uiverse.io";
+const UIVERSE_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36";
+const UIVERSE_CURL_STATUS_MARKER: &str = "\n__UIVERSE_HTTP_STATUS__:";
+
+#[cfg(windows)]
+const UIVERSE_CURL_BINARY: &str = "curl.exe";
+#[cfg(not(windows))]
+const UIVERSE_CURL_BINARY: &str = "curl";
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UiversePostImport {
+    url: String,
+    id: String,
+    username: String,
+    friendly_id: String,
+    #[serde(rename = "type")]
+    post_type: Option<String>,
+    theme: Option<String>,
+    background_color: Option<String>,
+    version: u32,
+    title: Option<String>,
+    author_name: Option<String>,
+    author_username: Option<String>,
+    source_website: Option<String>,
+    html: String,
+    css: String,
+}
+
+#[derive(Deserialize)]
+struct UiverseRouteDataResponse {
+    post: UiversePostSummary,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UiversePostSummary {
+    id: String,
+    friendly_id: String,
+    version: u32,
+    #[serde(default, rename = "type")]
+    post_type: Option<String>,
+    #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
+    background_color: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    user: Option<UiversePostUser>,
+    #[serde(default)]
+    post_source: Option<UiversePostSource>,
+}
+
+#[derive(Deserialize)]
+struct UiversePostUser {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UiversePostSource {
+    #[serde(default)]
+    website: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UiversePostCodeResponse {
+    html: String,
+    css: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FigImageAsset {
+    hash: String,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct UiverseFetchError {
+    message: String,
+    status: Option<reqwest::StatusCode>,
+    content_type: Option<String>,
+    body: String,
+}
+
+struct ParsedUiverseUrl {
+    username: String,
+    friendly_id: String,
+    canonical_url: String,
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_uiverse_post_url(input: &str) -> Result<ParsedUiverseUrl, String> {
+    let parsed = reqwest::Url::parse(input)
+        .map_err(|err| format!("Invalid URL: {err}"))?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Unsupported URL scheme. Use http:// or https://".to_string());
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL is missing a host".to_string())?
+        .to_ascii_lowercase();
+    if host != UIVERSE_HOST && host != format!("www.{UIVERSE_HOST}") {
+        return Err(format!(
+            "Unsupported host '{host}'. Expected '{UIVERSE_HOST}'"
+        ));
+    }
+
+    let segments: Vec<_> = parsed
+        .path_segments()
+        .ok_or_else(|| "URL path is malformed".to_string())?
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    if segments.len() != 2 {
+        return Err(
+            "Uiverse URL must look like https://uiverse.io/{username}/{friendlyId}".to_string(),
+        );
+    }
+
+    let username = segments[0].trim().to_string();
+    let friendly_id = segments[1].trim().to_string();
+    if username.is_empty() || friendly_id.is_empty() {
+        return Err(
+            "Uiverse URL must include both username and friendlyId path segments".to_string(),
+        );
+    }
+
+    let canonical_url = format!("https://{UIVERSE_HOST}/{username}/{friendly_id}");
+    Ok(ParsedUiverseUrl {
+        username,
+        friendly_id,
+        canonical_url,
+    })
+}
+
+fn looks_like_html(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("<!doctype html") || lower.contains("<html") || lower.contains("cloudflare")
+}
+
+fn should_fallback_to_curl(err: &UiverseFetchError) -> bool {
+    matches!(err.status, Some(status) if status == reqwest::StatusCode::FORBIDDEN)
+        || err
+            .content_type
+            .as_deref()
+            .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("text/html"))
+        || looks_like_html(&err.body)
+}
+
+async fn fetch_json_with_reqwest<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+) -> Result<T, UiverseFetchError> {
+    let response = client
+        .get(url.clone())
+        .header(reqwest::header::USER_AGENT, UIVERSE_USER_AGENT)
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|err| UiverseFetchError {
+            message: format!("Request failed for {url}: {err}"),
+            status: None,
+            content_type: None,
+            body: String::new(),
+        })?;
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body = response.text().await.map_err(|err| UiverseFetchError {
+        message: format!("Failed to read response body from {url}: {err}"),
+        status: Some(status),
+        content_type: content_type.clone(),
+        body: String::new(),
+    })?;
+
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        return Err(UiverseFetchError {
+            message: format!("Uiverse request failed ({status}) for {url}. Body: {snippet}"),
+            status: Some(status),
+            content_type,
+            body,
+        });
+    }
+
+    serde_json::from_str::<T>(&body).map_err(|err| UiverseFetchError {
+        message: format!("Invalid JSON response from {url}: {err}"),
+        status: Some(status),
+        content_type,
+        body,
+    })
+}
+
+async fn fetch_json_with_curl<T: DeserializeOwned + Send + 'static>(
+    url: reqwest::Url,
+) -> Result<T, String> {
+    let url_string = url.to_string();
+    let error_url = url_string.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut command = Command::new(UIVERSE_CURL_BINARY);
+        command
+            .args([
+                "-sS",
+                "-L",
+                "--compressed",
+                "-H",
+                &format!("User-Agent: {UIVERSE_USER_AGENT}"),
+                "-H",
+                "X-Requested-With: XMLHttpRequest",
+                "-H",
+                "Accept: application/json",
+                "-o",
+                "-",
+                "-w",
+                &format!("{UIVERSE_CURL_STATUS_MARKER}%{{http_code}}"),
+                &url_string,
+            ]);
+
+        let output = command
+            .output()
+            .map_err(|err| format!("Failed to run {UIVERSE_CURL_BINARY} for {url_string}: {err}"))?;
+
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("Uiverse curl output for {url_string} was not valid UTF-8: {err}"))?;
+        let (body, status_part) = stdout.rsplit_once(UIVERSE_CURL_STATUS_MARKER).ok_or_else(|| {
+            format!("Uiverse curl output for {url_string} did not include an HTTP status marker")
+        })?;
+
+        let status = status_part
+            .trim()
+            .parse::<u16>()
+            .map_err(|err| format!("Failed to parse curl HTTP status for {url_string}: {err}"))?;
+
+        if status != 200 {
+            let snippet: String = body.chars().take(200).collect();
+            return Err(format!(
+                "Uiverse request failed ({status}) for {url_string}. Body: {snippet}"
+            ));
+        }
+
+        serde_json::from_str::<T>(body)
+            .map_err(|err| format!("Invalid JSON response from {url_string}: {err}"))
+    })
+    .await
+    .map_err(|err| format!("Curl task failed for {error_url}: {err}"))?
+}
+
+async fn fetch_json<T: DeserializeOwned + Send + 'static>(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+) -> Result<T, String> {
+    match fetch_json_with_reqwest(client, url.clone()).await {
+        Ok(value) => Ok(value),
+        Err(err) if should_fallback_to_curl(&err) => {
+            match fetch_json_with_curl(url).await {
+                Ok(value) => Ok(value),
+                Err(curl_err) => Err(format!("{}; curl fallback also failed: {curl_err}", err.message)),
+            }
+        }
+        Err(err) => Err(err.message),
+    }
+}
 
 fn enumerate_system_fonts() -> Vec<FontFamily> {
     let source = SystemSource::new();
@@ -133,11 +422,85 @@ async fn load_system_font(family: String, style: String) -> Result<Vec<u8>, Stri
 }
 
 #[tauri::command]
+async fn fetch_uiverse_post(url: String) -> Result<UiversePostImport, String> {
+    let parsed = parse_uiverse_post_url(&url)?;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|err| format!("Failed to create HTTP client: {err}"))?;
+
+    let mut metadata_url =
+        reqwest::Url::parse(&format!("https://{UIVERSE_HOST}/{}/{}", parsed.username, parsed.friendly_id))
+            .map_err(|err| format!("Failed to build metadata URL: {err}"))?;
+    metadata_url
+        .query_pairs_mut()
+        .append_pair("_data", "routes/$username.$friendlyId");
+
+    let metadata: UiverseRouteDataResponse = fetch_json(&client, metadata_url).await?;
+    if metadata.post.id.trim().is_empty() {
+        return Err("Uiverse metadata response did not contain a post id".to_string());
+    }
+
+    let mut code_url =
+        reqwest::Url::parse(&format!("https://{UIVERSE_HOST}/resource/post/code/{}", metadata.post.id))
+            .map_err(|err| format!("Failed to build code URL: {err}"))?;
+    code_url
+        .query_pairs_mut()
+        .append_pair("v", &metadata.post.version.to_string())
+        .append_pair("_data", "routes/resource.post.code.$id");
+
+    let code: UiversePostCodeResponse = fetch_json(&client, code_url).await?;
+
+    let author_name = normalize_optional(
+        metadata
+            .post
+            .user
+            .as_ref()
+            .and_then(|user| user.name.clone()),
+    );
+    let author_username = normalize_optional(
+        metadata
+            .post
+            .user
+            .as_ref()
+            .and_then(|user| user.username.clone()),
+    )
+    .or_else(|| Some(parsed.username.clone()));
+
+    Ok(UiversePostImport {
+        url: parsed.canonical_url,
+        id: metadata.post.id,
+        username: parsed.username,
+        friendly_id: normalize_optional(Some(metadata.post.friendly_id))
+            .unwrap_or(parsed.friendly_id),
+        post_type: normalize_optional(metadata.post.post_type),
+        theme: normalize_optional(metadata.post.theme),
+        background_color: normalize_optional(metadata.post.background_color),
+        version: metadata.post.version,
+        title: normalize_optional(metadata.post.title),
+        author_name,
+        author_username,
+        source_website: normalize_optional(
+            metadata
+                .post
+                .post_source
+                .as_ref()
+                .and_then(|source| source.website.clone()),
+        ),
+        html: code.html,
+        css: code.css,
+    })
+}
+
+#[tauri::command]
 fn build_fig_file(
     schema_deflated: Vec<u8>,
     kiwi_data: Vec<u8>,
     thumbnail_png: Vec<u8>,
     meta_json: String,
+    images: Vec<FigImageAsset>,
 ) -> Result<Vec<u8>, String> {
     use std::io::{Cursor, Write};
 
@@ -185,6 +548,15 @@ fn build_fig_file(
     zip.write_all(meta_json.as_bytes())
         .map_err(|e| e.to_string())?;
 
+    for image in images {
+        if image.hash.trim().is_empty() {
+            continue;
+        }
+        zip.start_file(format!("images/{}", image.hash), options)
+            .map_err(|e| e.to_string())?;
+        zip.write_all(&image.data).map_err(|e| e.to_string())?;
+    }
+
     let result = zip.finish().map_err(|e| e.to_string())?;
     Ok(result.into_inner())
 }
@@ -203,7 +575,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             build_fig_file,
             list_system_fonts,
-            load_system_font
+            load_system_font,
+            fetch_uiverse_post
         ])
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

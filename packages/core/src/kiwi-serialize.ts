@@ -6,10 +6,24 @@ import { weightToStyle } from './fonts'
 import { encodeVectorNetworkBlob } from './vector'
 import { stringToGuid, VARIABLE_BINDING_FIELDS } from './kiwi/kiwi-convert'
 
-import type { NodeChange, Paint, VariableConsumptionEntry } from './kiwi/codec'
+import type { NodeChange, Paint, PluginDataEntry, VariableConsumptionEntry } from './kiwi/codec'
 import type { SceneGraph, SceneNode, CharacterStyleOverride } from './scene-graph'
 
 type KiwiNodeChange = NodeChange & Record<string, unknown>
+
+function serializePluginData(pluginData: SceneNode['pluginData']): PluginDataEntry[] {
+  const entries: PluginDataEntry[] = []
+  for (const [compoundKey, value] of Object.entries(pluginData)) {
+    const separator = compoundKey.indexOf(':')
+    if (separator <= 0 || separator === compoundKey.length - 1) continue
+    entries.push({
+      pluginID: compoundKey.slice(0, separator),
+      key: compoundKey.slice(separator + 1),
+      value
+    })
+  }
+  return entries
+}
 
 export function parseFigKiwiChunks(binary: Uint8Array): Uint8Array[] | null {
   const header = new TextDecoder().decode(binary.slice(0, 8))
@@ -227,6 +241,8 @@ export function sceneNodeToKiwi(
 
   if (fillPaints.length > 0) nc.fillPaints = fillPaints
   if (strokePaints.length > 0) nc.strokePaints = strokePaints
+  const pluginData = serializePluginData(node.pluginData)
+  if (pluginData.length > 0) nc.pluginData = pluginData
 
   if (node.cornerRadius > 0 || node.independentCorners) {
     nc.cornerRadius = node.cornerRadius

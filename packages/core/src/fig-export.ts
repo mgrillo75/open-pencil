@@ -1,4 +1,4 @@
-import { zipSync, deflateSync } from 'fflate'
+import { zipSync, deflateSync, type Zippable } from 'fflate'
 
 import { CANVAS_BG_COLOR, IS_TAURI } from './constants'
 import { sceneNodeToKiwi, fractionalPosition, buildFigKiwi } from './kiwi-serialize'
@@ -19,6 +19,11 @@ const THUMBNAIL_1X1 = Uint8Array.from(
 )
 
 type KiwiNodeChange = NodeChange & Record<string, unknown>
+
+interface FigImageAsset {
+  hash: string
+  data: Uint8Array
+}
 
 function variableValueToKiwi(
   value: VariableValue,
@@ -49,6 +54,22 @@ function variableValueToKiwi(
 
 const THUMBNAIL_WIDTH = 400
 const THUMBNAIL_HEIGHT = 225
+
+function collectUsedImages(graph: SceneGraph): FigImageAsset[] {
+  const hashes = new Set<string>()
+  for (const node of graph.getAllNodes()) {
+    for (const fill of node.fills) {
+      if (fill.type === 'IMAGE' && fill.imageHash) hashes.add(fill.imageHash)
+    }
+  }
+
+  const images: FigImageAsset[] = []
+  for (const hash of hashes) {
+    const data = graph.images.get(hash)
+    if (data) images.push({ hash, data })
+  }
+  return images
+}
 
 export async function exportFigFile(
   graph: SceneGraph,
@@ -219,6 +240,7 @@ export async function exportFigFile(
     app: 'OpenPencil',
     createdAt: new Date().toISOString()
   })
+  const usedImages = collectUsedImages(graph)
 
   if (IS_TAURI) {
     const { invoke } = await import('@tauri-apps/api/core')
@@ -227,15 +249,23 @@ export async function exportFigFile(
         schemaDeflated: Array.from(schemaDeflated),
         kiwiData: Array.from(kiwiData),
         thumbnailPng: Array.from(thumbnailPng),
-        metaJson
+        metaJson,
+        images: usedImages.map(({ hash, data }) => ({
+          hash,
+          data: Array.from(data)
+        }))
       })
     )
   }
 
   const canvasData = buildFigKiwi(schemaDeflated, kiwiData)
-  return zipSync({
-    'canvas.fig': [canvasData, { level: 0 }],
-    'thumbnail.png': [thumbnailPng, { level: 0 }],
+  const zipEntries: Zippable = {
+    'canvas.fig': [canvasData, { level: 0 as const }],
+    'thumbnail.png': [thumbnailPng, { level: 0 as const }],
     'meta.json': new TextEncoder().encode(metaJson)
-  })
+  }
+  for (const { hash, data } of usedImages) {
+    zipEntries[`images/${hash}`] = [data, { level: 0 as const }]
+  }
+  return zipSync(zipEntries)
 }
